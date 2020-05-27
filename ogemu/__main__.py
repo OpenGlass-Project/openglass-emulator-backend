@@ -57,6 +57,8 @@ async def main(websocket, path):
         else:
             print(f'Fatal error! Cannot interpret {opcode.name}')
             break
+        data = json.loads(await websocket.recv())
+        print(data)
 
 
 start_server = websockets.serve(main, "0.0.0.0", 8765)
