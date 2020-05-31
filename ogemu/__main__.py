@@ -4,118 +4,150 @@ import time
 import json
 import sys
 import logging
-from websocket_server import WebsocketServer
+from wss import WebSocketServer, NoMessagesError
 import threading
 
+logger = logging.getLogger('openglass.emulator')
+#logger.setLevel(logging.DEBUG)
+
+
+class StackOverflowError(Exception):
+    pass
+
+
+class Stack:
+    _list = []
+    def __init__(self, limit):
+        self.limit = limit
+
+    def pop(self):
+        return self._list.pop(0)
+
+    def push(self, value):
+        if len(self._list) < self.limit:
+            return self._list.insert(0, value)
+        else:
+            raise StackOverflowError
+
+
+stack = Stack(1000)
 action = None
-client = False
-current_client = None
-server = WebsocketServer(8765, host='localhost')
+buttons = {
+        "front": False,
+        "back": False,
+}
+server = WebSocketServer(8765)
+while not server.clients:
+    pass
 
 
-def new_client(nclient, server):
-    global client
+def handle_commands():
     global action
-    global current_client
-#    if client:
- #       return
-  #  else:
-   #     client = True
-    current_client = nclient
-    thread = threading.Thread(target=main)
-    thread.start()
-
-server.set_fn_new_client(new_client)
-
-
-def on_command(nclient, server, message):
-    global action
-    print(message)
-    message = json.loads(message)
-    if message['type'] == 'stop':
-        action = 'halt'
-    elif method['type'] == 'pause':
-        action = 'pause'
-    elif method['type'] == 'resume':
-        action = 'resume'
-server.set_fn_message_received(on_command)
+    while True:
+        try:
+            logger.debug('checking for messages')
+            message = server.first_message.data
+            logger.debug(f'got message: {message}')
+            message = json.loads(message)
+            if message['type'] == 'stop':
+                action = 'halt'
+            elif message['type'] == 'pause':
+                action = 'pause'
+            elif message['type'] == 'resume':
+                action = 'resume'
+            elif message['type'] == 'button':
+                buttons[message['button']] = message['status']
+        except NoMessagesError:
+            logger.debug('no messages')
+        time.sleep(1/1000000)
 
 
-#def client_left(nclient, server):
- #   global current_client
-  #  global client
-   # global action
-    #if nclient is current_client:
-     #   client = False
-      #  current_client = None
-       # action = 'halt'
-        #exit(0)
+def stringify(opcode, args):
+    logger.debug(f'{opcode.name} {" ".join([str(num) for num in args])}')
 
-#server.set_fn_client_left(client_left)
 
 def main():
     global action
-    server.send_message_to_all('{"type":"status", "status":"loading"}')
+    server.send('{"type":"status", "status":"loading"}')
     with open(sys.argv[1] if len(sys.argv) >= 2 else 'openglass.bin', 'rb') as f:
         bytecode = bytearray(f.read())[5:]
     i=0
     screen_msgs = []
-    server.send_message_to_all('{"type":"status", "status":"running"}')
+    server.send('{"type":"status", "status":"running"}')
     while True:
         opcode = ins.instructions[bytecode[i]]
         i+=1
         arg_count = pi.length_of_args(opcode)
         args = pi.parse_args(opcode, bytecode[i:i+arg_count])
         i += arg_count
+        stringify(opcode, args)
         if opcode is ins.POK:
-            print(f'POK {args[0]} {args[1]}')
             bytecode[args[1]] = args[0]
         elif opcode is ins.DEL:
-            print(f'DEL {args[0]}')
             time.sleep(args[0]/1000)
         elif opcode is ins.LON:
-            print(f'LON')
-            server.send_message_to_all('{"type":"led", "status":true}')
+            server.send('{"type":"led", "status":true}')
         elif opcode is ins.LOF:
-            print(f'LOF')
-            server.send_message_to_all('{"type":"led", "status":false}')
+            server.send('{"type":"led", "status":false}')
         elif opcode is ins.JMP:
-            print(f'JMP {args[0]}')
+            if args[1]: stack.push(i)
             i = args[0]-0
         elif opcode is ins.ADB:
-            print(f'ADB {args[0]} {args[1]}')
             bytecode[args[0]] = bytecode[args[0]] + args[1]
         elif opcode is ins.SCW:
-            print(f'SCW {args[0]} {args[1]}')
-            screen_msgs.append(threading.Thread(target=server.send_message_to_all, args=(json.dumps({'type':'screen', 'status':True, 'x':args[0], 'y':args[1]}),)))
+            screen_msgs.append({'type':'screen', 'status':True, 'x':args[0], 'y':args[1]})
         elif opcode is ins.SCB:
-            print(f'SCB {args[0]} {args[1]}')
-            screen_msgs.append(threading.Thread(target=server.send_message_to_all, args=(json.dumps({'type':'screen', 'status':False, 'x':args[0], 'y':args[1]}),)))
+            screen_msgs.append({'type':'screen', 'status':False, 'x':args[0], 'y':args[1]})
         elif opcode is ins.SCF:
-            print(f'SCF')
-            for thread in screen_msgs:
-                thread.start()
+            server.send(json.dumps(screen_msgs))
             screen_msgs = []
         elif opcode is ins.JEB:
-            print(f'JEB {args[0]} {args[1]} {args[2]}')
             if bytecode[args[1]] == args[2]:
+                if args[3]: stack.push(i)
                 i = args[0]
-                print('jumped')
+                logger.debug('jumped')
+        elif opcode is ins.JLB:
+            if bytecode[args[1]] < args[2]:
+                if args[3]: stack.push(i)
+                i = args[0]
+                logger.debug('jumped')
+        elif opcode is ins.JGB:
+            if bytecode[args[1]] > args[2]:
+                if args[3]: stack.push(i)
+                i = args[0]
+                logger.debug('jumped')
         elif opcode is ins.HLT:
-            print(f'HLT')
-            server.send_message_to_all('{"type":"status", "status":"stopped", "reason":"instruction"}')
+            server.send('{"type":"status", "status":"stopped", "reason":"instruction"}')
             exit(0)
+        elif opcode is ins.SBB:
+            bytecode[args[0]] = bytecode[args[0]] - args[1]
+        elif opcode is ins.GBD:
+            bytecode[args[1]] = 1 if buttons[{2:'front', 0:'back'}[args[0]]] else 0
+        elif opcode is ins.RET:
+            i = stack.pop()
+        elif opcode is ins.REB:
+            if bytecode[args[0]] == args[1]:
+                i = stack.pop()
+        elif opcode is ins.RLB:
+            if bytecode[args[0]] < args[1]:
+                i = stack.pop()
+        elif opcode is ins.RGB:
+            if bytecode[args[0]] > args[1]:
+                i = stack.pop()
         else:
-            print(f'Fatal error! Cannot interpret {opcode.name}')
-            server.send_message_to_all(json.dumps({'type':'status', 'status':'stopped', 'reason':'bad_known_opcode', 'name':opcode.name}))
+            logger.debug(f'Fatal error! Cannot interpret {opcode.name}')
+            server.send(json.dumps({'type':'status', 'status':'stopped', 'reason':'bad_known_opcode', 'name':opcode.name}))
             exit(0)
         if action == 'halt':
-            server.send_message_to_all('{"type":"status", "status":"stopped", "reason":"request"}')
+            server.send('{"type":"status", "status":"stopped", "reason":"request"}')
             exit(0)
         elif action == 'pause':
+            server.send('{"type":"status", "status":"paused"}')
             while not action == 'resume':
                 pass
+            server.send('{"type":"status", "status":"running"}')
             action = None
+        time.sleep(1/1000000)
 
-
-server.run_forever()
+threading.Thread(target=main).start()
+threading.Thread(target=handle_commands, daemon=True).start()
